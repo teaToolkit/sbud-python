@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sbud"
+version = "0.0.1"
+description = "Client for the sbud service, which manages Docker Sandboxes for AI agents. Early preview."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "teaToolkit" }]
+dependencies = []
+classifiers = [
+	"Development Status :: 2 - Pre-Alpha",
+	"Programming Language :: Python :: 3",
+	"Typing :: Typed",
+]
+
+[dependency-groups]
+test = ["pytest>=8"]
+lint = ["mypy>=1.13", "ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sbud"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+filterwarnings = ["error"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["src", "tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N"]
+ignore = ["W191", "E501"]
+
+[tool.ruff.format]
+indent-style = "tab"
