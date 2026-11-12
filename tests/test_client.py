@@ -75,3 +75,87 @@ def test_no_service_is_unavailable(sock_path: str) -> None:
 def test_sbud_socket_overrides_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
 	monkeypatch.setenv("SBUD_SOCKET", "/tmp/elsewhere.sock")
 	assert SbudClient().endpoint == "/tmp/elsewhere.sock"
+
+
+def _serve_raw(path: str, response: bytes, seen: list[bytes]) -> threading.Thread:
+	server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	server.bind(path)
+	server.listen(1)
+
+	def run() -> None:
+		conn, _ = server.accept()
+		with conn:
+			request = b""
+			while b"\r\n\r\n" not in request:
+				request += conn.recv(4096)
+			head, _, body = request.partition(b"\r\n\r\n")
+			length = next((int(line.split(b":")[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:")), 0)
+			while len(body) < length:
+				body += conn.recv(4096)
+			seen.append(head + b"\r\n\r\n" + body)
+			conn.sendall(response)
+		server.close()
+
+	thread = threading.Thread(target=run)
+	thread.start()
+	return thread
+
+
+def test_a_change_goes_as_a_json_patch_with_its_query(sock_path: str) -> None:
+	seen: list[bytes] = []
+	payload = json.dumps({"name": "a", "changes": []}).encode()
+	thread = _serve_raw(sock_path, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload), seen)
+	plan = SbudClient(sock_path).change_sandbox(
+		"a", [{"op": "replace", "path": "/ramGiB", "value": 8}], mode="clone", dry_run=True, confirm_stops=["a", "b"]
+	)
+	thread.join()
+	assert plan == {"name": "a", "changes": []}
+	request = seen[0]
+	assert request.startswith(b"PATCH /v1/sandboxes/a?mode=clone&dryRun=true&confirmStops=a%2Cb HTTP/1.1\r\n")
+	assert b"Content-Type: application/json-patch+json\r\n" in request
+	assert request.endswith(b'[{"op": "replace", "path": "/ramGiB", "value": 8}]')
+
+
+def test_every_faulty_field_comes_with_the_error(sock_path: str) -> None:
+	problem = json.dumps(
+		{
+			"status": 422,
+			"kind": "invalid",
+			"title": "Some fields are wrong.",
+			"errors": [{"field": "ramGiB", "message": "RAM must be a whole number of GiB."}],
+		}
+	).encode()
+	thread = _serve_raw(sock_path, b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: %d\r\n\r\n%s" % (len(problem), problem), [])
+	with pytest.raises(SbudError) as caught:
+		SbudClient(sock_path).create_sandbox({"name": "x"}, dry_run=True)
+	thread.join()
+	assert (caught.value.status, caught.value.kind) == (422, "invalid")
+	assert caught.value.errors == [{"field": "ramGiB", "message": "RAM must be a whole number of GiB."}]
+
+
+def test_events_are_read_from_a_chunked_stream_as_they_arrive(sock_path: str) -> None:
+	stream = b': connected\n\nevent: task\ndata: {"id": "t1"}\n\n: keep-alive\n\nevent: sandboxes\ndata: {}\n\n'
+	chunks = b"".join(b"%x\r\n%s\r\n" % (len(stream[i : i + 7]), stream[i : i + 7]) for i in range(0, len(stream), 7))
+	thread = _serve_raw(
+		sock_path, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n" + chunks + b"0\r\n\r\n", []
+	)
+	events = list(SbudClient(sock_path).events(["task", "sandboxes"]))
+	thread.join()
+	assert [(e.channel, e.data) for e in events] == [("task", {"id": "t1"}), ("sandboxes", {})]
+
+
+def test_an_extra_folder_is_named_by_its_path_inside_the_sandbox(sock_path: str) -> None:
+	seen: list[bytes] = []
+	thread = _serve_raw(sock_path, b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}", seen)
+	SbudClient(sock_path).remove_mount("a", "D:\\work\\shared\\")
+	thread.join()
+	assert seen[0].startswith(b"DELETE /v1/sandboxes/a/mounts/d/work/shared HTTP/1.1\r\n")
+
+
+def test_a_single_change_carries_the_stops_the_user_agreed_to(sock_path: str) -> None:
+	seen: list[bytes] = []
+	thread = _serve_raw(sock_path, b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}", seen)
+	SbudClient(sock_path).set_mount_read_only("a", "D:\\work\\shared", True, confirm_stops=["a", "b"])
+	thread.join()
+	assert seen[0].startswith(b"PATCH /v1/sandboxes/a/mounts/d/work/shared?confirmStops=a%2Cb HTTP/1.1\r\n")
+	assert seen[0].endswith(b'{"readOnly": true}')
